@@ -1,9 +1,9 @@
-/* Lampa Watch Status 1.0.3 — local marks, no CUB Premium required. */
+/* Lampa Watch Status 1.0.4 — local marks, no CUB Premium required. */
 (function () {
     'use strict';
     if (window.lampa_watch_status) return;
     var L, menuCard, fullRoot, fullCard, known = {}, seasons = {}, pending = {}, timer, paintTimer;
-    var VERSION = '1.0.3', THRESHOLD = 95, EPISODE_THRESHOLD = 90, TTL = 6 * 60 * 60 * 1000;
+    var VERSION = '1.0.4', THRESHOLD = 95, EPISODE_THRESHOLD = 90, TTL = 6 * 60 * 60 * 1000;
     var scanQueue = [], scanQueued = {}, scanBusy = false;
 
     function tv(card) { return !!(card.original_name || card.first_air_date || card.media_type === 'tv' || card.number_of_seasons); }
@@ -95,13 +95,13 @@
         var finished = false;
         var timeout;
         function armTimeout() { clearTimeout(timeout); timeout = setTimeout(fail, 15000); }
-        function fail() {
+        function fail(reason) {
             if (finished) return;
             finished = true;
             clearTimeout(timeout);
             delete pending[id];
             // Throttle failures too; never use a partial season response for completion.
-            seasons[id] = { time: Date.now() - TTL + 60000, day: today(), episodes: [] };
+            seasons[id] = { time: Date.now() - TTL + 60000, day: today(), episodes: [], error: typeof reason === 'string' ? reason : 'network' };
             onDone();
         }
         armTimeout();
@@ -109,18 +109,18 @@
             api.get('tv/' + card.id, {}, function (show) {
                 if (finished) return;
                 var list = show && show.seasons;
-                if (!Array.isArray(list) || !list.length) return fail();
+                if (!Array.isArray(list) || !list.length) return fail('missing-seasons');
                 // Unknown dates/counts on potentially released seasons make the inventory uncertain.
                 var regular = list.filter(function (s) { return s.season_number > 0; });
                 regular.sort(function (a, b) { return a.season_number - b.season_number; });
                 if ((show.number_of_seasons && show.number_of_seasons !== regular.length) || regular.some(function (s, i) {
                     return s.season_number !== i + 1 || !validDate(s.air_date) || !Number.isInteger(s.episode_count) || s.episode_count < 0;
-                })) return fail();
+                })) return fail('invalid-seasons');
                 var released = regular.filter(function (s) { return aired(s.air_date) && s.episode_count > 0; });
-                if (!released.length) return fail();
+                if (!released.length) return fail('no-released-seasons');
                 var episodes = [], index = 0;
                 function next() {
-                    if (finished || profile !== scope()) return fail();
+                    if (finished || profile !== scope()) return fail('profile-changed');
                     if (index === released.length) {
                         finished = true;
                         clearTimeout(timeout);
@@ -134,11 +134,11 @@
                     armTimeout();
                     api.get('tv/' + card.id + '/season/' + s.season_number, {}, function (data) {
                         if (finished) return;
-                        if (!data || !Array.isArray(data.episodes) || data.episodes.length !== s.episode_count) return fail();
+                        if (!data || !Array.isArray(data.episodes) || data.episodes.length !== s.episode_count) return fail('incomplete-season');
                         var seen = {};
                         for (var i = 0; i < data.episodes.length; i++) {
                             var ep = data.episodes[i];
-                            if (!Number.isInteger(ep.episode_number) || ep.episode_number < 1 || ep.episode_number > s.episode_count || seen[ep.episode_number] || !validDate(ep.air_date)) return fail();
+                            if (!Number.isInteger(ep.episode_number) || ep.episode_number < 1 || ep.episode_number > s.episode_count || seen[ep.episode_number] || !validDate(ep.air_date)) return fail('invalid-episodes');
                             seen[ep.episode_number] = true;
                             if (aired(ep.air_date)) episodes.push({ season: s.season_number, episode: ep.episode_number });
                         }
@@ -189,6 +189,39 @@
                 checkbox: true, checked: current === value, watchStatus: value,
                 onCheck: toggle, onSelect: toggle
             };
+        }).concat(tv(card) ? [{ title: 'Проверить автодосмотр', watchStatusDiagnostic: true, onSelect: function () { showDiagnostic(card); } }] : []);
+    }
+    function diagnostic(card) {
+        var entry = record(card), cache = seasons[key(card)], source = card.source || 'tmdb';
+        var reason = entry.hold ? 'paused' : entry.status === 'skip' ? 'skipped' : entry.status === 'viewed' && !entry.auto ? 'manual' : '';
+        if (!reason && source !== 'tmdb' && source !== 'cub') reason = 'unsupported-source';
+        if (!reason && pending[key(card)]) reason = 'pending';
+        if (!reason && (!L.Api.sources.tmdb || typeof L.Api.sources.tmdb.get !== 'function')) reason = 'missing-api';
+        if (!reason && (!cache || !cache.episodes.length)) reason = cache && cache.error || 'not-checked';
+        var episodes = (cache && cache.episodes || []).map(function (ep) {
+            var road = episodeRoad(card, ep.season, ep.episode);
+            return { season: ep.season, episode: ep.episode, percent: Number(road.percent) || 0, time: Number(road.time) || 0, duration: Number(road.duration) || 0, complete: complete(road, EPISODE_THRESHOLD) };
+        });
+        if (!reason) reason = episodes.every(function (ep) { return ep.complete; }) ? 'complete' : 'incomplete-progress';
+        return { version: VERSION, reason: reason, status: entry.status || '', automatic: !!entry.auto, episodes: episodes };
+    }
+    function showDiagnostic(card) {
+        // Read-only diagnosis: never clear a manual mark, a hold, history or timecodes.
+        loadSeries(card, function () {
+            var report = diagnostic(card), labels = {
+                paused: 'Автоматизация приостановлена после ручной отметки', skipped: 'Отмечено «Не буду смотреть»', manual: 'Вручную отмечено просмотренным',
+                'unsupported-source': 'Источник не поддерживает автоматическую проверку', pending: 'Состав серий ещё загружается', 'missing-api': 'API сезонов недоступен',
+                network: 'Не удалось загрузить состав серий', 'missing-seasons': 'В ответе нет сезонов', 'invalid-seasons': 'Неполные номера, даты или количество сезонов',
+                'no-released-seasons': 'Нет подтверждённых вышедших сезонов', 'profile-changed': 'Во время проверки сменился профиль',
+                'incomplete-season': 'Количество серий не совпало с составом сезона', 'invalid-episodes': 'У серии отсутствует корректная дата или номер',
+                'not-checked': 'Состав серий ещё не проверен', complete: 'Все вышедшие серии досмотрены', 'incomplete-progress': 'Не все серии имеют подтверждённый досмотр'
+            };
+            var rows = [{ title: labels[report.reason] || report.reason, subtitle: 'Watch Status ' + VERSION }];
+            report.episodes.forEach(function (ep) {
+                rows.push({ title: 'Сезон ' + ep.season + ', серия ' + ep.episode + ': ' + Math.round(ep.percent) + '%', subtitle: ep.duration > 0 ? Math.round(ep.time) + ' / ' + Math.round(ep.duration) + ' сек · ' + (ep.complete ? 'досмотрена' : 'нет досмотра ≥90%') : 'Длительность не сохранена' });
+            });
+            function close() { L.Select.close(); }
+            L.Select.show({ title: 'Проверка автодосмотра', items: rows, onSelect: close, onBack: close });
         });
     }
     function marker(root, card) {
@@ -253,7 +286,7 @@
             copy.items.splice.apply(copy.items, [at + 1, 0].concat(items(card)));
             copy.onCheck = function (item) { if (item.watchStatus) return item.onCheck(); if (check) return check.apply(this, arguments); };
             copy.onSelect = function (item) {
-                if (item.watchStatus) { item.onSelect(); return; }
+                if (item.watchStatus || item.watchStatusDiagnostic) { item.onSelect(); return; }
                 if (select) return select.apply(this, arguments);
             };
             return show.call(this, copy);
@@ -289,7 +322,7 @@
         if (!window.Lampa || !window.Lampa.Timeline) return false;
         L = window.Lampa;
         if (!L || !L.Maker || !L.Timeline || !L.Timeline.filename || !L.ContentRows || !L.Favorite || !L.Select || !L.Player) return false;
-        window.lampa_watch_status = { version: VERSION, status: status };
+        window.lampa_watch_status = { version: VERSION, status: status, diagnostic: diagnostic };
         patchCards();
         L.Favorite.listener.follow('add,added', function (event) {
             if (event.where !== 'wath') return;
