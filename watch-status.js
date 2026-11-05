@@ -1,9 +1,9 @@
-/* Lampa Watch Status 1.0.4 — local marks, no CUB Premium required. */
+/* Lampa Watch Status 1.0.5 — local marks, no CUB Premium required. */
 (function () {
     'use strict';
     if (window.lampa_watch_status) return;
     var L, menuCard, fullRoot, fullCard, known = {}, seasons = {}, pending = {}, timer, paintTimer;
-    var VERSION = '1.0.4', THRESHOLD = 95, EPISODE_THRESHOLD = 90, TTL = 6 * 60 * 60 * 1000;
+    var VERSION = '1.0.5', THRESHOLD = 95, EPISODE_THRESHOLD = 90, TTL = 6 * 60 * 60 * 1000;
     var scanQueue = [], scanQueued = {}, scanBusy = false;
 
     function tv(card) { return !!(card.original_name || card.first_air_date || card.media_type === 'tv' || card.number_of_seasons); }
@@ -50,7 +50,7 @@
     }
     function hidden(card) { var value = status(card); return value === 'viewed' || value === 'skip'; }
     function complete(road, threshold) {
-        // Numeric legacy timecodes and opening/eye marks are not completion evidence.
+        // Playback completion requires real seconds; explicit episode marks are handled separately.
         if (!road || typeof road !== 'object') return false;
         threshold = threshold || THRESHOLD;
         var percent = Number(road.percent), duration = Number(road.duration), time = Number(road.time);
@@ -59,6 +59,12 @@
     }
     function movieRoad(card) { return L.Timeline.watched(card, true); }
     function episodeRoad(card, season, episode) { return L.Timeline.watchedEpisode(card, season, episode, true); }
+    function episodeMarked(road) {
+        // Native episode Mark writes 95% with zero seconds when duration is unknown.
+        // Older/source-specific episode menus use 100% for the same explicit mark.
+        return !!road && typeof road === 'object' && (Number(road.percent) === 95 || Number(road.percent) === 100) && Number(road.time) === 0 && Number(road.duration) === 0;
+    }
+    function episodeComplete(road) { return episodeMarked(road) || complete(road, EPISODE_THRESHOLD); }
     function evaluate(card) {
         var entry = record(card);
         if (entry.status === 'skip' || entry.hold || (entry.status === 'viewed' && !entry.auto)) return;
@@ -68,7 +74,7 @@
         }
         var cache = seasons[key(card)];
         if (!cache || !cache.episodes.length) return;
-        var done = cache.episodes.every(function (ep) { return complete(episodeRoad(card, ep.season, ep.episode), EPISODE_THRESHOLD); });
+        var done = cache.episodes.every(function (ep) { return episodeComplete(episodeRoad(card, ep.season, ep.episode)); });
         if (done) {
             if (entry.status !== 'viewed') setStatus(card, 'viewed', true);
         } else if (entry.status === 'viewed' && entry.auto) {
@@ -200,7 +206,7 @@
         if (!reason && (!cache || !cache.episodes.length)) reason = cache && cache.error || 'not-checked';
         var episodes = (cache && cache.episodes || []).map(function (ep) {
             var road = episodeRoad(card, ep.season, ep.episode);
-            return { season: ep.season, episode: ep.episode, percent: Number(road.percent) || 0, time: Number(road.time) || 0, duration: Number(road.duration) || 0, complete: complete(road, EPISODE_THRESHOLD) };
+            return { season: ep.season, episode: ep.episode, percent: Number(road.percent) || 0, time: Number(road.time) || 0, duration: Number(road.duration) || 0, marked: episodeMarked(road), complete: episodeComplete(road) };
         });
         if (!reason) reason = episodes.every(function (ep) { return ep.complete; }) ? 'complete' : 'incomplete-progress';
         return { version: VERSION, reason: reason, status: entry.status || '', automatic: !!entry.auto, episodes: episodes };
@@ -218,7 +224,7 @@
             };
             var rows = [{ title: labels[report.reason] || report.reason, subtitle: 'Watch Status ' + VERSION }];
             report.episodes.forEach(function (ep) {
-                rows.push({ title: 'Сезон ' + ep.season + ', серия ' + ep.episode + ': ' + Math.round(ep.percent) + '%', subtitle: ep.duration > 0 ? Math.round(ep.time) + ' / ' + Math.round(ep.duration) + ' сек · ' + (ep.complete ? 'досмотрена' : 'нет досмотра ≥90%') : 'Длительность не сохранена' });
+                rows.push({ title: 'Сезон ' + ep.season + ', серия ' + ep.episode + ': ' + ep.percent + '%', subtitle: ep.marked ? 'Отмечена просмотренной · длительность не требуется' : ep.duration > 0 ? Math.round(ep.time) + ' / ' + Math.round(ep.duration) + ' сек · ' + (ep.complete ? 'досмотрена' : 'нет досмотра ≥90%') : 'Длительность не сохранена' });
             });
             function close() { L.Select.close(); }
             L.Select.show({ title: 'Проверка автодосмотра', items: rows, onSelect: close, onBack: close });
